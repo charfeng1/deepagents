@@ -1,5 +1,14 @@
 # TUI Interaction: Controlling Interactive UIs via PTY
 
+> **Status**: Design Document (Future Work)
+>
+> This document describes how to control terminal UIs programmatically using
+> PTY and ANSI escape sequences. **PTY mode is not yet implemented** - this
+> serves as a design reference for future implementation.
+>
+> **Current state**: stdin pipe mode works for many programs
+> **Future work**: PTY mode for full TUI control (ssh, vim, etc.)
+
 ## The Problem
 
 Claude Code (and other modern CLIs) use interactive terminal UIs that require:

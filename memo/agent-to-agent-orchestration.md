@@ -1,5 +1,14 @@
 # Agent-to-Agent Orchestration via Interactive Shell
 
+> **Status**: Design Document (Future Work)
+>
+> This document describes the vision for agent-to-agent orchestration using
+> DeepAgents' async shell capabilities. The basic stdin pipe support is now
+> implemented, but full PTY mode (needed for some TUI interactions) is future work.
+>
+> **What works now**: Spawning processes, reading output, sending stdin input
+> **Future work**: PTY mode for programs requiring `isatty()=True`
+
 ## Concept
 
 Use DeepAgents' interactive shell capability to spawn and control other AI agent CLIs (Claude Code, Aider, etc.), enabling hierarchical agent orchestration.

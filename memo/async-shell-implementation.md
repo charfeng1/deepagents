@@ -1,5 +1,15 @@
 # Async Shell Implementation Plan
 
+> **Status**: Partially Implemented
+>
+> | Feature | Status |
+> |---------|--------|
+> | Background execution (`run_in_background`) | ✅ Implemented |
+> | `shell_output` tool | ✅ Implemented |
+> | `shell_input` tool (stdin pipe) | ✅ Implemented |
+> | `kill_shell` tool | ✅ Implemented |
+> | PTY mode (`interactive=True`) | ❌ Future work |
+
 ## Overview
 
 Enhance DeepAgents' shell capabilities to support background execution, stdin input, and full PTY (pseudo-terminal) support. This addresses a major gap compared to Claude Agent SDK while also exceeding its capabilities.

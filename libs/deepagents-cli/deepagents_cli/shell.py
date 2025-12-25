@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 import threading
@@ -14,12 +15,20 @@ from langchain.tools import ToolRuntime, tool
 from langchain_core.messages import ToolMessage
 from langchain_core.tools.base import ToolException
 
+logger = logging.getLogger(__name__)
+
 
 class ShellMiddleware(AgentMiddleware[AgentState, Any]):
     """Give shell access to agents with support for background execution.
 
     This shell will execute on the local machine and has NO safeguards except
     for the human in the loop safeguard provided by the CLI itself.
+
+    Security Note:
+        This middleware uses shell=True intentionally to support shell features
+        like pipes, redirects, and environment variable expansion that agents
+        commonly need. The human-in-the-loop approval system is the primary
+        security control. Do not use this in contexts without user approval.
 
     Supports:
     - Blocking execution (default): Run command and wait for result
@@ -54,6 +63,7 @@ class ShellMiddleware(AgentMiddleware[AgentState, Any]):
 
         # Background process tracking
         self._processes: dict[str, subprocess.Popen] = {}
+        self._threads: dict[str, threading.Thread] = {}
         self._output_buffers: dict[str, list[str]] = defaultdict(list)
         self._locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
 
@@ -155,12 +165,16 @@ class ShellMiddleware(AgentMiddleware[AgentState, Any]):
         *,
         tool_call_id: str | None,
     ) -> ToolMessage:
-        """Execute a shell command synchronously and return the result."""
+        """Execute a shell command synchronously and return the result.
+
+        Note: Uses shell=True intentionally to support pipes, redirects, etc.
+        Security is provided by human-in-the-loop approval in the CLI.
+        """
         try:
             result = subprocess.run(
                 command,
                 check=False,
-                shell=True,
+                shell=True,  # Intentional: enables pipes, redirects, env vars
                 capture_output=True,
                 text=True,
                 timeout=self._timeout,
@@ -203,13 +217,17 @@ class ShellMiddleware(AgentMiddleware[AgentState, Any]):
         )
 
     def _run_background(self, command: str) -> str:
-        """Start a background process with stdin pipe support."""
+        """Start a background process with stdin pipe support.
+
+        Note: Uses shell=True intentionally to support pipes, redirects, etc.
+        Security is provided by human-in-the-loop approval in the CLI.
+        """
         shell_id = str(uuid.uuid4())[:8]
 
         try:
             process = subprocess.Popen(
                 command,
-                shell=True,
+                shell=True,  # Intentional: enables pipes, redirects, env vars
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -219,6 +237,7 @@ class ShellMiddleware(AgentMiddleware[AgentState, Any]):
                 bufsize=1,  # Line buffered
             )
         except Exception as e:
+            logger.error(f"Failed to start background process: {e}")
             return f"Error starting process: {e}"
 
         self._processes[shell_id] = process
@@ -232,7 +251,7 @@ class ShellMiddleware(AgentMiddleware[AgentState, Any]):
                     with self._locks[shell_id]:
                         self._output_buffers[shell_id].append(line)
             except (ValueError, OSError):
-                # Process closed
+                # Process closed - this is expected
                 pass
             finally:
                 try:
@@ -241,6 +260,7 @@ class ShellMiddleware(AgentMiddleware[AgentState, Any]):
                     pass
 
         thread = threading.Thread(target=reader, daemon=True)
+        self._threads[shell_id] = thread
         thread.start()
 
         return (
@@ -258,7 +278,7 @@ class ShellMiddleware(AgentMiddleware[AgentState, Any]):
 
         process = self._processes[shell_id]
 
-        # Get buffered output
+        # Get buffered output (thread-safe)
         with self._locks[shell_id]:
             output = "".join(self._output_buffers[shell_id])
             self._output_buffers[shell_id] = []  # Clear after reading
@@ -269,7 +289,7 @@ class ShellMiddleware(AgentMiddleware[AgentState, Any]):
             status = "running"
         else:
             status = f"exited (code: {exit_code})"
-            # Clean up finished process
+            # Clean up finished process (waits for reader thread)
             self._cleanup(shell_id)
 
         # Truncate if needed
@@ -316,13 +336,24 @@ class ShellMiddleware(AgentMiddleware[AgentState, Any]):
                 process.kill()
                 process.wait(timeout=2)
         except Exception as e:
+            logger.error(f"Error killing process {shell_id}: {e}")
             return f"Error killing process: {e}"
 
         self._cleanup(shell_id)
         return f"Killed process {shell_id}"
 
     def _cleanup(self, shell_id: str) -> None:
-        """Clean up a finished process."""
+        """Clean up a finished process and its resources.
+
+        Waits for the reader thread to finish before cleaning up
+        to avoid race conditions with buffer access.
+        """
+        # Wait for reader thread to finish (with timeout to avoid hanging)
+        thread = self._threads.pop(shell_id, None)
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=0.5)
+
+        # Now safe to clean up resources
         if shell_id in self._processes:
             del self._processes[shell_id]
         if shell_id in self._output_buffers:
@@ -335,8 +366,8 @@ class ShellMiddleware(AgentMiddleware[AgentState, Any]):
         for shell_id in list(self._processes.keys()):
             try:
                 self._kill_process(shell_id)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Error during cleanup of shell {shell_id}: {e}")
 
     def list_shells(self) -> list[str]:
         """List all active shell IDs."""
