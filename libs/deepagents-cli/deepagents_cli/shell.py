@@ -1,9 +1,13 @@
-"""Simplified middleware that exposes a basic shell tool to agents."""
+"""Enhanced middleware that exposes shell tools with background execution support."""
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
+import threading
+import uuid
+from collections import defaultdict
 from typing import Any
 
 from langchain.agents.middleware.types import AgentMiddleware, AgentState
@@ -11,12 +15,25 @@ from langchain.tools import ToolRuntime, tool
 from langchain_core.messages import ToolMessage
 from langchain_core.tools.base import ToolException
 
+logger = logging.getLogger(__name__)
+
 
 class ShellMiddleware(AgentMiddleware[AgentState, Any]):
-    """Give basic shell access to agents via the shell.
+    """Give shell access to agents with support for background execution.
 
     This shell will execute on the local machine and has NO safeguards except
     for the human in the loop safeguard provided by the CLI itself.
+
+    Security Note:
+        This middleware uses shell=True intentionally to support shell features
+        like pipes, redirects, and environment variable expansion that agents
+        commonly need. The human-in-the-loop approval system is the primary
+        security control. Do not use this in contexts without user approval.
+
+    Supports:
+    - Blocking execution (default): Run command and wait for result
+    - Background execution: Run command in background, read output later
+    - Interactive input: Send input to running background processes
     """
 
     def __init__(
@@ -31,7 +48,7 @@ class ShellMiddleware(AgentMiddleware[AgentState, Any]):
 
         Args:
             workspace_root: Working directory for shell commands.
-            timeout: Maximum time in seconds to wait for command completion.
+            timeout: Maximum time in seconds to wait for blocking command completion.
                 Defaults to 120 seconds.
             max_output_bytes: Maximum number of bytes to capture from command output.
                 Defaults to 100,000 bytes.
@@ -41,58 +58,123 @@ class ShellMiddleware(AgentMiddleware[AgentState, Any]):
         super().__init__()
         self._timeout = timeout
         self._max_output_bytes = max_output_bytes
-        self._tool_name = "shell"
         self._env = env if env is not None else os.environ.copy()
         self._workspace_root = workspace_root
 
-        # Build description with working directory information
+        # Background process tracking
+        self._processes: dict[str, subprocess.Popen] = {}
+        self._threads: dict[str, threading.Thread] = {}
+        self._output_buffers: dict[str, list[str]] = defaultdict(list)
+        self._locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
+
+        # Build tools
+        self.tools = [
+            self._build_shell_tool(),
+            self._build_shell_output_tool(),
+            self._build_shell_input_tool(),
+            self._build_kill_shell_tool(),
+        ]
+
+    def _build_shell_tool(self):
+        """Build the main shell tool."""
         description = (
-            f"Execute a shell command directly on the host. Commands will run in "
-            f"the working directory: {workspace_root}. Each command runs in a fresh shell "
-            f"environment with the current process's environment variables. Commands may "
-            f"be truncated if they exceed the configured timeout or output limits."
+            f"Execute a shell command. Commands run in: {self._workspace_root}\n"
+            f"Set run_in_background=True for long-running commands (servers, watchers, etc). "
+            f"Background commands return a shell_id to check output later with shell_output."
         )
 
-        @tool(self._tool_name, description=description)
+        @tool("shell", description=description)
         def shell_tool(
             command: str,
             runtime: ToolRuntime[None, AgentState],
+            run_in_background: bool = False,
         ) -> ToolMessage | str:
             """Execute a shell command.
 
             Args:
                 command: The shell command to execute.
                 runtime: The tool runtime context.
+                run_in_background: If True, run in background and return shell_id.
             """
-            return self._run_shell_command(command, tool_call_id=runtime.tool_call_id)
+            if not command or not isinstance(command, str):
+                raise ToolException("Shell tool expects a non-empty command string.")
 
-        self._shell_tool = shell_tool
-        self.tools = [self._shell_tool]
+            if run_in_background:
+                return self._run_background(command)
+            else:
+                return self._run_blocking(command, tool_call_id=runtime.tool_call_id)
 
-    def _run_shell_command(
+        return shell_tool
+
+    def _build_shell_output_tool(self):
+        """Build the shell_output tool."""
+        @tool("shell_output", description="Get output from a background shell process.")
+        def shell_output_tool(
+            shell_id: str,
+            runtime: ToolRuntime[None, AgentState],
+        ) -> str:
+            """Get output from a background shell.
+
+            Args:
+                shell_id: The ID of the background shell.
+                runtime: The tool runtime context.
+            """
+            return self._get_output(shell_id)
+
+        return shell_output_tool
+
+    def _build_shell_input_tool(self):
+        """Build the shell_input tool."""
+        @tool("shell_input", description="Send input to a background shell process (writes to stdin).")
+        def shell_input_tool(
+            shell_id: str,
+            input_text: str,
+            runtime: ToolRuntime[None, AgentState],
+        ) -> str:
+            """Send input to a background shell.
+
+            Args:
+                shell_id: The ID of the background shell.
+                input_text: Text to send to the process stdin.
+                runtime: The tool runtime context.
+            """
+            return self._send_input(shell_id, input_text)
+
+        return shell_input_tool
+
+    def _build_kill_shell_tool(self):
+        """Build the kill_shell tool."""
+        @tool("kill_shell", description="Terminate a background shell process.")
+        def kill_shell_tool(
+            shell_id: str,
+            runtime: ToolRuntime[None, AgentState],
+        ) -> str:
+            """Kill a background shell.
+
+            Args:
+                shell_id: The ID of the background shell to kill.
+                runtime: The tool runtime context.
+            """
+            return self._kill_process(shell_id)
+
+        return kill_shell_tool
+
+    def _run_blocking(
         self,
         command: str,
         *,
         tool_call_id: str | None,
-    ) -> ToolMessage | str:
-        """Execute a shell command and return the result.
+    ) -> ToolMessage:
+        """Execute a shell command synchronously and return the result.
 
-        Args:
-            command: The shell command to execute.
-            tool_call_id: The tool call ID for creating a ToolMessage.
-
-        Returns:
-            A ToolMessage with the command output or an error message.
+        Note: Uses shell=True intentionally to support pipes, redirects, etc.
+        Security is provided by human-in-the-loop approval in the CLI.
         """
-        if not command or not isinstance(command, str):
-            msg = "Shell tool expects a non-empty command string."
-            raise ToolException(msg)
-
         try:
             result = subprocess.run(
                 command,
                 check=False,
-                shell=True,
+                shell=True,  # Intentional: enables pipes, redirects, env vars
                 capture_output=True,
                 text=True,
                 timeout=self._timeout,
@@ -130,9 +212,166 @@ class ShellMiddleware(AgentMiddleware[AgentState, Any]):
         return ToolMessage(
             content=output,
             tool_call_id=tool_call_id,
-            name=self._tool_name,
+            name="shell",
             status=status,
         )
+
+    def _run_background(self, command: str) -> str:
+        """Start a background process with stdin pipe support.
+
+        Note: Uses shell=True intentionally to support pipes, redirects, etc.
+        Security is provided by human-in-the-loop approval in the CLI.
+        """
+        shell_id = str(uuid.uuid4())[:8]
+
+        try:
+            process = subprocess.Popen(
+                command,
+                shell=True,  # Intentional: enables pipes, redirects, env vars
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                cwd=self._workspace_root,
+                env=self._env,
+                bufsize=1,  # Line buffered
+            )
+        except Exception as e:
+            logger.error(f"Failed to start background process: {e}")
+            return f"Error starting process: {e}"
+
+        self._processes[shell_id] = process
+
+        # Start output reader thread
+        def reader():
+            try:
+                for line in iter(process.stdout.readline, ''):
+                    if not line:
+                        break
+                    with self._locks[shell_id]:
+                        self._output_buffers[shell_id].append(line)
+            except (ValueError, OSError):
+                # Process closed - this is expected
+                pass
+            finally:
+                try:
+                    process.stdout.close()
+                except Exception:
+                    pass
+
+        thread = threading.Thread(target=reader, daemon=True)
+        self._threads[shell_id] = thread
+        thread.start()
+
+        return (
+            f"Background process started with shell_id: {shell_id}\n"
+            f"Command: {command}\n"
+            f"Use shell_output('{shell_id}') to read output.\n"
+            f"Use shell_input('{shell_id}', 'text') to send input.\n"
+            f"Use kill_shell('{shell_id}') to terminate."
+        )
+
+    def _get_output(self, shell_id: str) -> str:
+        """Get buffered output from a background process."""
+        if shell_id not in self._processes:
+            return f"Error: No process with shell_id '{shell_id}'"
+
+        process = self._processes[shell_id]
+
+        # Get buffered output (thread-safe)
+        with self._locks[shell_id]:
+            output = "".join(self._output_buffers[shell_id])
+            self._output_buffers[shell_id] = []  # Clear after reading
+
+        # Check process status
+        exit_code = process.poll()
+        if exit_code is None:
+            status = "running"
+        else:
+            status = f"exited (code: {exit_code})"
+            # Clean up finished process (waits for reader thread)
+            self._cleanup(shell_id)
+
+        # Truncate if needed
+        if len(output) > self._max_output_bytes:
+            output = output[: self._max_output_bytes]
+            output += f"\n... truncated at {self._max_output_bytes} bytes"
+
+        return f"[{status}]\n{output}" if output else f"[{status}]\n<no new output>"
+
+    def _send_input(self, shell_id: str, input_text: str) -> str:
+        """Send input to a background process."""
+        if shell_id not in self._processes:
+            return f"Error: No process with shell_id '{shell_id}'"
+
+        process = self._processes[shell_id]
+
+        # Check if process is still running
+        if process.poll() is not None:
+            return f"Error: Process {shell_id} has already exited"
+
+        # Check if stdin is available
+        if process.stdin is None:
+            return f"Error: Process {shell_id} stdin not available"
+
+        try:
+            process.stdin.write(input_text)
+            process.stdin.flush()
+            return f"Sent to {shell_id}: {repr(input_text)}"
+        except (OSError, BrokenPipeError) as e:
+            return f"Error sending input: {e}"
+
+    def _kill_process(self, shell_id: str) -> str:
+        """Kill a background process."""
+        if shell_id not in self._processes:
+            return f"Error: No process with shell_id '{shell_id}'"
+
+        process = self._processes[shell_id]
+
+        try:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
+        except Exception as e:
+            logger.error(f"Error killing process {shell_id}: {e}")
+            return f"Error killing process: {e}"
+
+        self._cleanup(shell_id)
+        return f"Killed process {shell_id}"
+
+    def _cleanup(self, shell_id: str) -> None:
+        """Clean up a finished process and its resources.
+
+        Waits for the reader thread to finish before cleaning up
+        to avoid race conditions with buffer access.
+        """
+        # Wait for reader thread to finish (with timeout to avoid hanging)
+        thread = self._threads.pop(shell_id, None)
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=0.5)
+
+        # Now safe to clean up resources
+        if shell_id in self._processes:
+            del self._processes[shell_id]
+        if shell_id in self._output_buffers:
+            del self._output_buffers[shell_id]
+        if shell_id in self._locks:
+            del self._locks[shell_id]
+
+    def cleanup_all(self) -> None:
+        """Kill all background processes. Call on shutdown."""
+        for shell_id in list(self._processes.keys()):
+            try:
+                self._kill_process(shell_id)
+            except Exception as e:
+                logger.warning(f"Error during cleanup of shell {shell_id}: {e}")
+
+    def list_shells(self) -> list[str]:
+        """List all active shell IDs."""
+        return list(self._processes.keys())
 
 
 __all__ = ["ShellMiddleware"]
